@@ -1,3 +1,6 @@
+// g++ -std=c++11 update_hic_header_stream.cpp -o update_hic_header_stream
+// ./update_hic_header_stream input.hic output.hic key1 file1 [key2 file2 ...]
+
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -5,12 +8,6 @@
 #include <cstdint>
 #include <cstring>
 #include <sys/stat.h>
-
-// Utility to check if a file exists and is a regular file
-static bool file_exists(const std::string& path) {
-    struct stat buf;
-    return stat(path.c_str(), &buf) == 0 && S_ISREG(buf.st_mode);
-}
 
 static int32_t readInt32LE(const char* p) {
     int32_t v; std::memcpy(&v, p, 4); return v;
@@ -28,41 +25,33 @@ static void writeInt64LE(char* p, int64_t v) {
 int main(int argc, char** argv) {
     if (argc < 5 || ((argc - 3) % 2) != 0) {
         std::cerr << "Usage: " << argv[0]
-                  << " <in.hic> <out.hic> <key1> <value1> [<key2> <value2> ...]\n"
-                  << "If <valueN> is a file, its contents will be used as the attribute value.\n";
+                  << " <in.hic> <out.hic> <key1> <file1> [<key2> <file2> ...]\n"
+                  << "Each value must be a filename; the file's contents (binary) will be used as the attribute value.\n";
         return 1;
     }
     const std::string inPath  = argv[1];
     const std::string outPath = argv[2];
 
-    // collect new attrs, reading file contents if value is a file
-    std::vector<std::pair<std::string,std::string>> newAttrs;
-    for (int i = 3; i+1 < argc; i += 2) {
+    // --- Collect new attributes: each value is a file to read (binary) ---
+    std::vector<std::pair<std::string, std::string>> newAttrs;
+    for (int i = 3; i + 1 < argc; i += 2) {
         std::string key = argv[i];
-        std::string value_candidate = argv[i+1];
-        std::string value;
-        if (file_exists(value_candidate)) {
-            // Read file contents as value (binary-safe)
-            std::ifstream fin(value_candidate, std::ios::binary);
-            if (!fin) {
-                std::cerr << "Could not open value file: " << value_candidate << "\n";
-                return 1;
-            }
-            std::string contents((std::istreambuf_iterator<char>(fin)),
-                                  std::istreambuf_iterator<char>());
-            value = contents;
-        } else {
-            value = value_candidate;
+        std::string filename = argv[i+1];
+        std::ifstream fin(filename, std::ios::binary);
+        if (!fin) {
+            std::cerr << "Could not open value file: " << filename << "\n";
+            return 1;
         }
-        newAttrs.emplace_back(key, value);
+        std::string contents((std::istreambuf_iterator<char>(fin)),
+                             std::istreambuf_iterator<char>());
+        newAttrs.emplace_back(key, contents);
     }
 
-    // --- Attribute order fix: ensure statistics comes before hicFileScalingFactor among newAttrs ---
+    // --- Optionally: reorder statistics and hicFileScalingFactor if both present ---
     {
         std::vector<std::pair<std::string,std::string>> reorderedAttrs;
         bool statisticsFound = false, scalingFound = false;
         std::pair<std::string,std::string> statisticsAttr, scalingAttr;
-        // Pull out statistics and scaling, but remember their order
         for (const auto& kv : newAttrs) {
             if (kv.first == "statistics") {
                 statisticsFound = true;
@@ -74,7 +63,7 @@ int main(int argc, char** argv) {
                 reorderedAttrs.push_back(kv);
             }
         }
-        // Now, insert statistics and scaling in right order
+        // Insert statistics, then scaling, at the beginning if present (and in that order)
         if (statisticsFound) reorderedAttrs.insert(reorderedAttrs.begin(), statisticsAttr);
         if (scalingFound) {
             auto it = reorderedAttrs.begin();
