@@ -7,7 +7,6 @@
 #include <string>
 #include <cstdint>
 #include <cstring>
-#include <sys/stat.h>
 
 static int32_t readInt32LE(const char* p) {
     int32_t v; std::memcpy(&v, p, 4); return v;
@@ -32,7 +31,7 @@ int main(int argc, char** argv) {
     const std::string inPath  = argv[1];
     const std::string outPath = argv[2];
 
-    // --- Collect new attributes: each value is a file to read (binary) ---
+    // --- Collect new attributes: each value is a file to read (binary), in argv order ---
     std::vector<std::pair<std::string, std::string>> newAttrs;
     for (int i = 3; i + 1 < argc; i += 2) {
         std::string key = argv[i];
@@ -45,32 +44,6 @@ int main(int argc, char** argv) {
         std::string contents((std::istreambuf_iterator<char>(fin)),
                              std::istreambuf_iterator<char>());
         newAttrs.emplace_back(key, contents);
-    }
-
-    // --- Optionally: reorder statistics and hicFileScalingFactor if both present ---
-    {
-        std::vector<std::pair<std::string,std::string>> reorderedAttrs;
-        bool statisticsFound = false, scalingFound = false;
-        std::pair<std::string,std::string> statisticsAttr, scalingAttr;
-        for (const auto& kv : newAttrs) {
-            if (kv.first == "statistics") {
-                statisticsFound = true;
-                statisticsAttr = kv;
-            } else if (kv.first == "hicFileScalingFactor") {
-                scalingFound = true;
-                scalingAttr = kv;
-            } else {
-                reorderedAttrs.push_back(kv);
-            }
-        }
-        // Insert statistics, then scaling, at the beginning if present (and in that order)
-        if (statisticsFound) reorderedAttrs.insert(reorderedAttrs.begin(), statisticsAttr);
-        if (scalingFound) {
-            auto it = reorderedAttrs.begin();
-            if (statisticsFound) ++it;
-            reorderedAttrs.insert(it, scalingAttr);
-        }
-        newAttrs = reorderedAttrs;
     }
 
     // --- PASS 1: READ HEADER & STREAM-COPY THE REST ---
@@ -106,14 +79,13 @@ int main(int argc, char** argv) {
     do { readPush(c); } while(c!='\0');
 
     // e) normVectorIndexPosition & length (if v9+)
-    size_t nviPosField = 0, nviLenField=0;
+    size_t nviPosField = 0;
     int64_t origNviPos = 0;
     if (version > 8) {
         nviPosField = headerBuf.size();
         fin.read(tmp8,8); headerBuf.insert(headerBuf.end(), tmp8, tmp8+8);
         origNviPos = readInt64LE(tmp8);
-        nviLenField = headerBuf.size();
-        fin.read(tmp8,8); headerBuf.insert(headerBuf.end(), tmp8, tmp8+8);
+        fin.read(tmp8,8); headerBuf.insert(headerBuf.end(), tmp8, tmp8+8); // nviLen
     }
 
     // f) attribute count
@@ -151,7 +123,7 @@ int main(int argc, char** argv) {
     // copy old attributes
     fout.write(headerBuf.data()+attrListStart, attrListEnd-attrListStart);
 
-    // append new attributes (handle binary-safe value)
+    // append new attributes (handle binary-safe value), IN COMMAND LINE ORDER
     for (auto &kv : newAttrs) {
         fout.write(kv.first.c_str(), kv.first.size());
         fout.put('\0');
