@@ -36,22 +36,32 @@ int main(int argc, char** argv) {
     for (int i = 3; i+1 < argc; i += 2)
         newAttrs.emplace_back(argv[i], argv[i+1]);
 
-    // --- Attribute order fix: make sure statistics comes before hicFileScalingFactor ---
+    // --- Attribute order fix: ensure statistics comes before hicFileScalingFactor among newAttrs ---
     {
-        std::vector<std::pair<std::string,std::string>> orderedAttrs;
-        // Add statistics first (if present)
-        for (const auto& kv : newAttrs)
-            if (kv.first == "statistics")
-                orderedAttrs.push_back(kv);
-        // Then hicFileScalingFactor (if present)
-        for (const auto& kv : newAttrs)
-            if (kv.first == "hicFileScalingFactor")
-                orderedAttrs.push_back(kv);
-        // Then any other attributes
-        for (const auto& kv : newAttrs)
-            if (kv.first != "statistics" && kv.first != "hicFileScalingFactor")
-                orderedAttrs.push_back(kv);
-        newAttrs = orderedAttrs;
+        std::vector<std::pair<std::string,std::string>> reorderedAttrs;
+        bool statisticsFound = false, scalingFound = false;
+        std::pair<std::string,std::string> statisticsAttr, scalingAttr;
+        // Pull out statistics and scaling, but remember their order
+        for (const auto& kv : newAttrs) {
+            if (kv.first == "statistics") {
+                statisticsFound = true;
+                statisticsAttr = kv;
+            } else if (kv.first == "hicFileScalingFactor") {
+                scalingFound = true;
+                scalingAttr = kv;
+            } else {
+                reorderedAttrs.push_back(kv);
+            }
+        }
+        // Now, insert statistics and scaling in right order
+        if (statisticsFound) reorderedAttrs.insert(reorderedAttrs.begin(), statisticsAttr);
+        if (scalingFound) {
+            // Place scaling right after statistics if present, else at front
+            auto it = reorderedAttrs.begin();
+            if (statisticsFound) ++it;
+            reorderedAttrs.insert(it, scalingAttr);
+        }
+        newAttrs = reorderedAttrs;
     }
 
     // --- PASS 1: READ HEADER & STREAM-COPY THE REST ---
