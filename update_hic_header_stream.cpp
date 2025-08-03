@@ -1,13 +1,16 @@
-// g++ -std=c++11 update_hic_header_stream.cpp -o update_hic_header_stream
-// ./update_hic_header_stream input.hic output.hic software "MyTool v1.2" graphs "chr1–chr2 stats"
-
-// update_hic_header_stream.cpp
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <string>
 #include <cstdint>
 #include <cstring>
+#include <sys/stat.h>
+
+// Utility to check if a file exists and is a regular file
+static bool file_exists(const std::string& path) {
+    struct stat buf;
+    return stat(path.c_str(), &buf) == 0 && S_ISREG(buf.st_mode);
+}
 
 static int32_t readInt32LE(const char* p) {
     int32_t v; std::memcpy(&v, p, 4); return v;
@@ -25,16 +28,34 @@ static void writeInt64LE(char* p, int64_t v) {
 int main(int argc, char** argv) {
     if (argc < 5 || ((argc - 3) % 2) != 0) {
         std::cerr << "Usage: " << argv[0]
-                  << " <in.hic> <out.hic> <key1> <value1> [<key2> <value2> ...]\n";
+                  << " <in.hic> <out.hic> <key1> <value1> [<key2> <value2> ...]\n"
+                  << "If <valueN> is a file, its contents will be used as the attribute value.\n";
         return 1;
     }
     const std::string inPath  = argv[1];
     const std::string outPath = argv[2];
 
-    // collect new attrs
+    // collect new attrs, reading file contents if value is a file
     std::vector<std::pair<std::string,std::string>> newAttrs;
-    for (int i = 3; i+1 < argc; i += 2)
-        newAttrs.emplace_back(argv[i], argv[i+1]);
+    for (int i = 3; i+1 < argc; i += 2) {
+        std::string key = argv[i];
+        std::string value_candidate = argv[i+1];
+        std::string value;
+        if (file_exists(value_candidate)) {
+            // Read file contents as value (binary-safe)
+            std::ifstream fin(value_candidate, std::ios::binary);
+            if (!fin) {
+                std::cerr << "Could not open value file: " << value_candidate << "\n";
+                return 1;
+            }
+            std::string contents((std::istreambuf_iterator<char>(fin)),
+                                  std::istreambuf_iterator<char>());
+            value = contents;
+        } else {
+            value = value_candidate;
+        }
+        newAttrs.emplace_back(key, value);
+    }
 
     // --- Attribute order fix: ensure statistics comes before hicFileScalingFactor among newAttrs ---
     {
@@ -56,7 +77,6 @@ int main(int argc, char** argv) {
         // Now, insert statistics and scaling in right order
         if (statisticsFound) reorderedAttrs.insert(reorderedAttrs.begin(), statisticsAttr);
         if (scalingFound) {
-            // Place scaling right after statistics if present, else at front
             auto it = reorderedAttrs.begin();
             if (statisticsFound) ++it;
             reorderedAttrs.insert(it, scalingAttr);
@@ -66,14 +86,12 @@ int main(int argc, char** argv) {
 
     // --- PASS 1: READ HEADER & STREAM-COPY THE REST ---
 
-    // 1) parse header+old attributes into headerBuf
     std::ifstream fin(inPath, std::ios::binary);
     if (!fin) { perror("open input"); return 1; }
 
     std::vector<char> headerBuf;
     headerBuf.reserve(1<<20); // ~1 MB, should cover the whole header
 
-    // helper to read one byte and push it
     auto readPush = [&](char &c) {
         fin.read(&c,1);
         if (!fin) { std::cerr<<"Unexpected EOF\n"; exit(1); }
@@ -105,7 +123,6 @@ int main(int argc, char** argv) {
         nviPosField = headerBuf.size();
         fin.read(tmp8,8); headerBuf.insert(headerBuf.end(), tmp8, tmp8+8);
         origNviPos = readInt64LE(tmp8);
-        // skip nviLength
         nviLenField = headerBuf.size();
         fin.read(tmp8,8); headerBuf.insert(headerBuf.end(), tmp8, tmp8+8);
     }
@@ -143,14 +160,13 @@ int main(int argc, char** argv) {
     fout.write(countBuf,4);
 
     // copy old attributes
-    fout.write(headerBuf.data()+attrListStart,
-               attrListEnd-attrListStart);
+    fout.write(headerBuf.data()+attrListStart, attrListEnd-attrListStart);
 
-    // append new attributes
+    // append new attributes (handle binary-safe value)
     for (auto &kv : newAttrs) {
         fout.write(kv.first.c_str(), kv.first.size());
         fout.put('\0');
-        fout.write(kv.second.c_str(), kv.second.size());
+        fout.write(kv.second.data(), kv.second.size());
         fout.put('\0');
     }
 
