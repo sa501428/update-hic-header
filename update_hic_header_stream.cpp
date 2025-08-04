@@ -1,5 +1,5 @@
 // g++ -std=c++11 update_hic_header_stream.cpp -o update_hic_header_stream
-// ./update_hic_header_stream input.hic output.hic key1 file1 [key2 file2 ...]
+// ./update_hic_header_stream input.hic output.hic statistics statistics.txt graphs graphs.txt
 
 #include <iostream>
 #include <fstream>
@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <cstring>
 
-// Read/write little-endian helpers
 static int32_t readInt32LE(const char* p) {
     int32_t v; std::memcpy(&v, p, 4); return v;
 }
@@ -22,55 +21,54 @@ static void writeInt64LE(char* p, int64_t v) {
     std::memcpy(p, &v, 8);
 }
 
+struct AttrKV {
+    std::string key, value;
+};
+
+std::vector<char> load_value_file(const std::string& file) {
+    std::ifstream fval(file, std::ios::binary);
+    if (!fval) {
+        std::cerr << "Error: cannot open value file: " << file << std::endl;
+        exit(1);
+    }
+    std::vector<char> valueBytes(
+        (std::istreambuf_iterator<char>(fval)),
+        std::istreambuf_iterator<char>()
+    );
+    while (!valueBytes.empty() && valueBytes.back() == '\0')
+        valueBytes.pop_back();
+    return valueBytes;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 5 || ((argc - 3) % 2) != 0) {
+    if (argc != 7) {
         std::cerr << "Usage: " << argv[0]
-                  << " <in.hic> <out.hic> <key1> <file1> [<key2> <file2> ...]\n";
-        std::cerr << "       Each value file will be inserted as an attribute value.\n";
+                  << " <in.hic> <out.hic> statistics <file1> graphs <file2>\n";
+        std::cerr << "  (Only 'statistics' and 'graphs' can be inserted in order after 'software'.)\n";
         return 1;
     }
     const std::string inPath  = argv[1];
     const std::string outPath = argv[2];
 
-    // Collect key and file-path pairs
-    struct AttrFile {
-        std::string key;
-        std::string file;
-        std::vector<char> valueBytes; // For preloading values & sizes
-    };
-    std::vector<AttrFile> newAttrs;
-    for (int i = 3; i + 1 < argc; i += 2) {
-        AttrFile af;
-        af.key = argv[i];
-        af.file = argv[i+1];
-
-        // Load value bytes from file
-        std::ifstream fval(af.file, std::ios::binary);
-        if (!fval) {
-            std::cerr << "Error: cannot open value file: " << af.file << std::endl;
-            return 1;
-        }
-        af.valueBytes = std::vector<char>(
-            (std::istreambuf_iterator<char>(fval)),
-            std::istreambuf_iterator<char>()
-        );
-        // --- FIX: Strip all trailing nulls ---
-        while (!af.valueBytes.empty() && af.valueBytes.back() == '\0')
-            af.valueBytes.pop_back();
-
-        newAttrs.push_back(std::move(af));
+    std::string statKey = argv[3], statFile = argv[4];
+    std::string graphKey = argv[5], graphFile = argv[6];
+    if (statKey != "statistics" || graphKey != "graphs") {
+        std::cerr << "Only 'statistics' and 'graphs' can be appended.\n";
+        return 1;
     }
 
-    // --- PASS 1: Read Header & Stream-Copy the Rest ---
+    // Preload values for new attrs
+    std::vector<char> statVal = load_value_file(statFile);
+    std::vector<char> graphVal = load_value_file(graphFile);
 
-    // 1) Parse header + old attributes into headerBuf
+    // --- PASS 1: Read Header & Original Attributes ---
+
     std::ifstream fin(inPath, std::ios::binary);
     if (!fin) { perror("open input"); return 1; }
 
     std::vector<char> headerBuf;
-    headerBuf.reserve(1<<20); // ~1 MB buffer for header
+    headerBuf.reserve(1<<20);
 
-    // helper to read one byte and push it
     auto readPush = [&](char &c) {
         fin.read(&c,1);
         if (!fin) { std::cerr<<"Unexpected EOF\n"; exit(1); }
@@ -96,13 +94,12 @@ int main(int argc, char** argv) {
     do { readPush(c); } while(c!='\0');
 
     // e) normVectorIndexPosition & length (if v9+)
-    size_t nviPosField = 0, nviLenField=0;
+    size_t nviPosField = 0;
     int64_t origNviPos = 0;
     if (version > 8) {
         nviPosField = headerBuf.size();
         fin.read(tmp8,8); headerBuf.insert(headerBuf.end(), tmp8, tmp8+8);
         origNviPos = readInt64LE(tmp8);
-        nviLenField = headerBuf.size();
         fin.read(tmp8,8); headerBuf.insert(headerBuf.end(), tmp8, tmp8+8);
     }
 
@@ -112,51 +109,68 @@ int main(int argc, char** argv) {
     int32_t origAttrCount = readInt32LE(tmp4);
 
     // g) read each existing key\0value\0
+    std::vector<AttrKV> origAttrs;
     for (int i = 0; i < origAttrCount; i++) {
-        do { readPush(c); } while(c!='\0');  // key
-        do { readPush(c); } while(c!='\0');  // value
+        std::string key, value;
+        while (true) { fin.read(&c,1); headerBuf.push_back(c); if (c=='\0') break; key += c; }
+        while (true) { fin.read(&c,1); headerBuf.push_back(c); if (c=='\0') break; value += c; }
+        origAttrs.push_back({key, value});
     }
     size_t attrListStart = attrCountField + 4;
     size_t attrListEnd   = headerBuf.size();
 
-    // Compute delta: new bytes added to header
-    int32_t newAttrCount = origAttrCount + (int)newAttrs.size();
-    size_t extraBytes = 0;
-    for (const auto &af : newAttrs) {
-        // key+\0 + value-bytes + \0
-        extraBytes += af.key.size() + 1 + af.valueBytes.size() + 1;
-    }
-    size_t delta = extraBytes;
+    // --- PASS 2: Build Updated Attribute List ---
 
-    // 2) Open output and write updated header
+    // Remove any existing statistics/graphs
+    std::vector<AttrKV> newAttrs;
+    newAttrs.reserve(origAttrs.size() + 2);
+    int softwareIdx = -1;
+    for (size_t i = 0; i < origAttrs.size(); ++i) {
+        const std::string& k = origAttrs[i].key;
+        if (k == "software") softwareIdx = (int)newAttrs.size();
+        if (k != "statistics" && k != "graphs") newAttrs.push_back(origAttrs[i]);
+    }
+    if (softwareIdx == -1) {
+        std::cerr << "Could not find 'software' attribute to insert after.\n";
+        return 1;
+    }
+
+    // Insert statistics/graphs after 'software'
+    auto it = newAttrs.begin() + (softwareIdx + 1);
+    it = newAttrs.insert(it, {"statistics", std::string(statVal.data(), statVal.size())});
+    it = newAttrs.insert(it+1, {"graphs", std::string(graphVal.data(), graphVal.size())});
+
+    int32_t newAttrCount = newAttrs.size();
+
+    // Compute extra bytes (total size difference)
+    size_t origAttrBytes = 0, newAttrBytes = 0;
+    for (const auto& a : origAttrs)
+        origAttrBytes += a.key.size() + 1 + a.value.size() + 1;
+    for (const auto& a : newAttrs)
+        newAttrBytes += a.key.size() + 1 + a.value.size() + 1;
+    size_t delta = newAttrBytes - origAttrBytes;
+
+    // --- Write updated header ---
+
     std::ofstream fout(outPath, std::ios::binary);
     if (!fout) { perror("open output"); return 1; }
-
-    // Copy up to attrCountField
     fout.write(headerBuf.data(), attrCountField);
 
-    // Write updated count
     char countBuf[4];
     writeInt32LE(countBuf, newAttrCount);
     fout.write(countBuf,4);
 
-    // Copy old attributes
-    fout.write(headerBuf.data() + attrListStart, attrListEnd - attrListStart);
-
-    // Append new attributes (with value file contents, null-terminated)
-    for (const auto &af : newAttrs) {
-        // Write key + null
-        fout.write(af.key.c_str(), af.key.size());
+    for (const auto& a : newAttrs) {
+        fout.write(a.key.c_str(), a.key.size());
         fout.put('\0');
-        // Write value bytes from file, then null
-        if (!af.valueBytes.empty())
-            fout.write(af.valueBytes.data(), af.valueBytes.size());
-        fout.put('\0'); // <-- This is crucial!
+        if (!a.value.empty())
+            fout.write(a.value.c_str(), a.value.size());
+        fout.put('\0');
     }
 
-    // 3) Stream-copy the rest of the file
+    // Stream-copy the rest of the file
     fin.seekg(attrListEnd, std::ios::beg);
-    const size_t BUF_SZ = 1<<20; // 1 MiB
+    const size_t BUF_SZ = 1<<20;
     std::vector<char> buf(BUF_SZ);
     while (fin) {
         fin.read(buf.data(), BUF_SZ);
@@ -165,50 +179,41 @@ int main(int argc, char** argv) {
     fin.close();
     fout.close();
 
-    // --- PASS 2: Patch All Pointers In-Place ---
+    // --- PASS 3: Patch Pointers ---
 
     std::fstream fupd(outPath, std::ios::in|std::ios::out|std::ios::binary);
     if (!fupd) { perror("reopen output"); return 1; }
 
     // a) header pointers
     fupd.seekp(footerPosField, std::ios::beg);
-    char p8[8];
-    writeInt64LE(p8, origFooterPos + (int64_t)delta);
-    fupd.write(p8,8);
+    writeInt64LE(tmp8, origFooterPos + (int64_t)delta);
+    fupd.write(tmp8,8);
 
     if (version > 8) {
         fupd.seekp(nviPosField, std::ios::beg);
-        writeInt64LE(p8, origNviPos + (int64_t)delta);
-        fupd.write(p8,8);
+        writeInt64LE(tmp8, origNviPos + (int64_t)delta);
+        fupd.write(tmp8,8);
     }
 
     // b) master-index entries
     int64_t newFooterPos = origFooterPos + (int64_t)delta;
     fupd.seekg(newFooterPos, std::ios::beg);
 
-    // skip nBytesV5
     if (version > 8) fupd.seekg(8, std::ios::cur);
     else             fupd.seekg(4, std::ios::cur);
 
-    // read nEntries
-    char i4[4];
-    fupd.read(i4,4);
-    int32_t nEntries = readInt32LE(i4);
+    fupd.read(tmp4,4);
+    int32_t nEntries = readInt32LE(tmp4);
 
     for (int32_t i = 0; i < nEntries; i++) {
-        // skip key string
         char ch;
         do { fupd.get(ch); } while(ch!='\0');
-
-        // now at 'position' field
         std::streamoff posField = fupd.tellg();
-        fupd.read(p8,8);
-        int64_t origPos = readInt64LE(p8);
-        writeInt64LE(p8, origPos + (int64_t)delta);
+        fupd.read(tmp8,8);
+        int64_t origPos = readInt64LE(tmp8);
+        writeInt64LE(tmp8, origPos + (int64_t)delta);
         fupd.seekp(posField, std::ios::beg);
-        fupd.write(p8,8);
-
-        // skip size
+        fupd.write(tmp8,8);
         fupd.seekg(4, std::ios::cur);
     }
 
@@ -216,36 +221,27 @@ int main(int argc, char** argv) {
     if (version > 8) {
         int64_t newNviPos = origNviPos + (int64_t)delta;
         fupd.seekg(newNviPos, std::ios::beg);
-
-        // read nNormVectors
-        fupd.read(i4,4);
-        int32_t nNorm = readInt32LE(i4);
-
+        fupd.read(tmp4,4);
+        int32_t nNorm = readInt32LE(tmp4);
         for (int i = 0; i < nNorm; i++) {
-            // skip type\0, chrIdx, unit\0, binSize
             char ch;
             do { fupd.get(ch); } while(ch!='\0');
             fupd.seekg(4, std::ios::cur);
             do { fupd.get(ch); } while(ch!='\0');
             fupd.seekg(4, std::ios::cur);
-
-            // patch the position field
             std::streamoff pp = fupd.tellg();
-            fupd.read(p8,8);
-            int64_t oP = readInt64LE(p8);
-            writeInt64LE(p8, oP + (int64_t)delta);
+            fupd.read(tmp8,8);
+            int64_t oP = readInt64LE(tmp8);
+            writeInt64LE(tmp8, oP + (int64_t)delta);
             fupd.seekp(pp, std::ios::beg);
-            fupd.write(p8,8);
-
-            // skip nBytes
+            fupd.write(tmp8,8);
             fupd.seekg(8, std::ios::cur);
         }
     }
 
     fupd.close();
     std::cout << "Wrote " << outPath
-              << " with " << newAttrs.size()
-              << " new attribute(s), pointers bumped by "
+              << " with statistics/graphs inserted after software, pointers bumped by "
               << delta << " bytes.\n";
     return 0;
 }
