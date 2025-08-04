@@ -40,22 +40,6 @@ std::vector<char> load_value_file_text(const std::string& file) {
     return std::vector<char>(value.begin(), value.end());
 }
 
-// Default: read as raw binary
-std::vector<char> load_value_file_binary(const std::string& file) {
-    std::ifstream fval(file, std::ios::binary);
-    if (!fval) {
-        std::cerr << "Error: cannot open value file: " << file << std::endl;
-        exit(1);
-    }
-    std::vector<char> valueBytes(
-        (std::istreambuf_iterator<char>(fval)),
-        std::istreambuf_iterator<char>()
-    );
-    while (!valueBytes.empty() && valueBytes.back() == '\0')
-        valueBytes.pop_back();
-    return valueBytes;
-}
-
 // Read null-terminated string from stream
 std::string readNullTerminatedString(std::ifstream& fin) {
     std::string result;
@@ -153,8 +137,51 @@ int main(int argc, char** argv) {
         while (true) { fin.read(&c,1); headerBuf.push_back(c); if (c=='\0') break; value += c; }
         origAttrs.push_back({key, value});
     }
-    size_t attrListStart = attrCountField + 4;
-    size_t attrListEnd   = headerBuf.size();
+    size_t attrListEnd = headerBuf.size();
+
+    // h) Read chromosome dictionary
+    std::vector<char> chrDictBuf;
+    chrDictBuf.reserve(1<<16);
+    
+    // Number of chromosomes
+    fin.read(tmp4,4); chrDictBuf.insert(chrDictBuf.end(), tmp4, tmp4+4);
+    int32_t nChrs = readInt32LE(tmp4);
+    
+    // Read each chromosome entry
+    for (int i = 0; i < nChrs; i++) {
+        // Chromosome name (null-terminated)
+        do { 
+            fin.read(&c,1); 
+            chrDictBuf.push_back(c); 
+        } while(c!='\0');
+        
+        // Chromosome size (int32 for v8-, int64 for v9+)
+        if (version > 8) {
+            fin.read(tmp8,8); chrDictBuf.insert(chrDictBuf.end(), tmp8, tmp8+8);
+        } else {
+            fin.read(tmp4,4); chrDictBuf.insert(chrDictBuf.end(), tmp4, tmp4+4);
+        }
+    }
+    
+    // i) Read resolution arrays
+    std::vector<char> resolutionBuf;
+    resolutionBuf.reserve(1<<16);
+    
+    // BP resolutions
+    fin.read(tmp4,4); resolutionBuf.insert(resolutionBuf.end(), tmp4, tmp4+4);
+    int32_t nBpRes = readInt32LE(tmp4);
+    for (int i = 0; i < nBpRes; i++) {
+        fin.read(tmp4,4); resolutionBuf.insert(resolutionBuf.end(), tmp4, tmp4+4);
+    }
+    
+    // Fragment resolutions
+    fin.read(tmp4,4); resolutionBuf.insert(resolutionBuf.end(), tmp4, tmp4+4);
+    int32_t nFragRes = readInt32LE(tmp4);
+    for (int i = 0; i < nFragRes; i++) {
+        fin.read(tmp4,4); resolutionBuf.insert(resolutionBuf.end(), tmp4, tmp4+4);
+    }
+    
+    size_t dataStart = fin.tellg();
 
     // --- PASS 2: Build Updated Attribute List ---
 
@@ -212,8 +239,14 @@ int main(int argc, char** argv) {
         fout.put('\0');
     }
 
+    // Write chromosome dictionary
+    fout.write(chrDictBuf.data(), chrDictBuf.size());
+
+    // Write resolution arrays
+    fout.write(resolutionBuf.data(), resolutionBuf.size());
+
     // Stream-copy the rest of the file
-    fin.seekg(attrListEnd, std::ios::beg);
+    fin.seekg(dataStart, std::ios::beg);
     const size_t BUF_SZ = 1<<20;
     std::vector<char> buf(BUF_SZ);
     while (fin) {
