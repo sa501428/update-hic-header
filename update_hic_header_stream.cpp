@@ -54,8 +54,8 @@ int main(int argc, char** argv) {
             (std::istreambuf_iterator<char>(fval)),
             std::istreambuf_iterator<char>()
         );
-        // --- MINIMAL FIX: Strip trailing null if present ---
-        if (!af.valueBytes.empty() && af.valueBytes.back() == '\0')
+        // --- FIX: Strip all trailing nulls ---
+        while (!af.valueBytes.empty() && af.valueBytes.back() == '\0')
             af.valueBytes.pop_back();
 
         newAttrs.push_back(std::move(af));
