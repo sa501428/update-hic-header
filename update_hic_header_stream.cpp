@@ -25,7 +25,22 @@ struct AttrKV {
     std::string key, value;
 };
 
-std::vector<char> load_value_file(const std::string& file) {
+// Helper to mimic Juicer: read file as lines, append '\n' after each line.
+std::vector<char> load_value_file_text(const std::string& file) {
+    std::ifstream fval(file);
+    if (!fval) {
+        std::cerr << "Error: cannot open value file: " << file << std::endl;
+        exit(1);
+    }
+    std::string line, value;
+    while (std::getline(fval, line)) {
+        value += line + "\n";
+    }
+    return std::vector<char>(value.begin(), value.end());
+}
+
+// Default: read as raw binary
+std::vector<char> load_value_file_binary(const std::string& file) {
     std::ifstream fval(file, std::ios::binary);
     if (!fval) {
         std::cerr << "Error: cannot open value file: " << file << std::endl;
@@ -57,9 +72,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Preload values for new attrs
-    std::vector<char> statVal = load_value_file(statFile);
-    std::vector<char> graphVal = load_value_file(graphFile);
+    // Use Juicer-style text read for statistics/graphs
+    std::vector<char> statVal = load_value_file_text(statFile);
+    std::vector<char> graphVal = load_value_file_text(graphFile);
 
     // --- PASS 1: Read Header & Original Attributes ---
 
