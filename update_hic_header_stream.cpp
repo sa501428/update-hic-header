@@ -1,5 +1,5 @@
-// g++ -std=c++11 update_hic_header_stream.cpp -o update_hic_header_stream
-// ./update_hic_header_stream input.hic output.hic statistics statistics.txt graphs graphs.txt
+// g++ -std=c++11 update_hic_header.cpp -o update_hic_header
+// ./update_hic_header input.hic output.hic statistics statistics.txt graphs graphs.txt
 
 #include <iostream>
 #include <fstream>
@@ -7,6 +7,7 @@
 #include <string>
 #include <cstdint>
 #include <cstring>
+#include <map>
 
 static int32_t readInt32LE(const char* p) {
     int32_t v; std::memcpy(&v, p, 4); return v;
@@ -55,6 +56,22 @@ std::vector<char> load_value_file_binary(const std::string& file) {
     return valueBytes;
 }
 
+// Read null-terminated string from stream
+std::string readNullTerminatedString(std::ifstream& fin) {
+    std::string result;
+    char c;
+    while (fin.get(c) && c != '\0') {
+        result += c;
+    }
+    return result;
+}
+
+// Write null-terminated string to stream
+void writeNullTerminatedString(std::ofstream& fout, const std::string& str) {
+    fout.write(str.c_str(), str.length());
+    fout.put('\0');
+}
+
 int main(int argc, char** argv) {
     if (argc != 7) {
         std::cerr << "Usage: " << argv[0]
@@ -79,7 +96,10 @@ int main(int argc, char** argv) {
     // --- PASS 1: Read Header & Original Attributes ---
 
     std::ifstream fin(inPath, std::ios::binary);
-    if (!fin) { perror("open input"); return 1; }
+    if (!fin) { 
+        std::cerr << "Error: cannot open input file: " << inPath << std::endl;
+        return 1; 
+    }
 
     std::vector<char> headerBuf;
     headerBuf.reserve(1<<20);
@@ -99,7 +119,7 @@ int main(int argc, char** argv) {
     fin.read(tmp4,4); headerBuf.insert(headerBuf.end(), tmp4, tmp4+4);
     int32_t version = readInt32LE(tmp4);
 
-    // c) footerPosition
+    // c) footerPosition (master index position)
     size_t footerPosField = headerBuf.size();
     char tmp8[8];
     fin.read(tmp8,8); headerBuf.insert(headerBuf.end(), tmp8, tmp8+8);
@@ -111,11 +131,13 @@ int main(int argc, char** argv) {
     // e) normVectorIndexPosition & length (if v9+)
     size_t nviPosField = 0;
     int64_t origNviPos = 0;
+    int64_t origNviLen = 0;
     if (version > 8) {
         nviPosField = headerBuf.size();
         fin.read(tmp8,8); headerBuf.insert(headerBuf.end(), tmp8, tmp8+8);
         origNviPos = readInt64LE(tmp8);
         fin.read(tmp8,8); headerBuf.insert(headerBuf.end(), tmp8, tmp8+8);
+        origNviLen = readInt64LE(tmp8);
     }
 
     // f) attribute count
@@ -168,13 +190,20 @@ int main(int argc, char** argv) {
     // --- Write updated header ---
 
     std::ofstream fout(outPath, std::ios::binary);
-    if (!fout) { perror("open output"); return 1; }
+    if (!fout) { 
+        std::cerr << "Error: cannot open output file: " << outPath << std::endl;
+        return 1; 
+    }
+    
+    // Write header up to attribute count
     fout.write(headerBuf.data(), attrCountField);
 
+    // Write new attribute count
     char countBuf[4];
     writeInt32LE(countBuf, newAttrCount);
     fout.write(countBuf,4);
 
+    // Write new attributes
     for (const auto& a : newAttrs) {
         fout.write(a.key.c_str(), a.key.size());
         fout.put('\0');
@@ -197,7 +226,10 @@ int main(int argc, char** argv) {
     // --- PASS 3: Patch Pointers ---
 
     std::fstream fupd(outPath, std::ios::in|std::ios::out|std::ios::binary);
-    if (!fupd) { perror("reopen output"); return 1; }
+    if (!fupd) { 
+        std::cerr << "Error: cannot reopen output file for pointer updates" << std::endl;
+        return 1; 
+    }
 
     // a) header pointers
     fupd.seekp(footerPosField, std::ios::beg);
@@ -208,55 +240,75 @@ int main(int argc, char** argv) {
         fupd.seekp(nviPosField, std::ios::beg);
         writeInt64LE(tmp8, origNviPos + (int64_t)delta);
         fupd.write(tmp8,8);
+        fupd.seekp(nviPosField + 8, std::ios::beg);
+        writeInt64LE(tmp8, origNviLen);
+        fupd.write(tmp8,8);
     }
 
     // b) master-index entries
     int64_t newFooterPos = origFooterPos + (int64_t)delta;
     fupd.seekg(newFooterPos, std::ios::beg);
 
-    if (version > 8) fupd.seekg(8, std::ios::cur);
-    else             fupd.seekg(4, std::ios::cur);
+    // Read footer size
+    long footerSize;
+    if (version > 8) {
+        fupd.read(tmp8,8);
+        footerSize = readInt64LE(tmp8);
+    } else {
+        fupd.read(tmp4,4);
+        footerSize = readInt32LE(tmp4);
+    }
 
+    // Read number of entries
     fupd.read(tmp4,4);
     int32_t nEntries = readInt32LE(tmp4);
 
+    // Update each master index entry
     for (int32_t i = 0; i < nEntries; i++) {
+        // Skip key string
         char ch;
         do { fupd.get(ch); } while(ch!='\0');
+        
+        // Update position
         std::streamoff posField = fupd.tellg();
         fupd.read(tmp8,8);
         int64_t origPos = readInt64LE(tmp8);
         writeInt64LE(tmp8, origPos + (int64_t)delta);
         fupd.seekp(posField, std::ios::beg);
         fupd.write(tmp8,8);
-        fupd.seekg(4, std::ios::cur);
+        fupd.seekg(4, std::ios::cur); // Skip size field
     }
 
-    // c) normalization-vector index
+    // c) normalization-vector index (if version > 8)
     if (version > 8) {
         int64_t newNviPos = origNviPos + (int64_t)delta;
         fupd.seekg(newNviPos, std::ios::beg);
         fupd.read(tmp4,4);
         int32_t nNorm = readInt32LE(tmp4);
+        
         for (int i = 0; i < nNorm; i++) {
+            // Skip type string
             char ch;
             do { fupd.get(ch); } while(ch!='\0');
-            fupd.seekg(4, std::ios::cur);
+            fupd.seekg(4, std::ios::cur); // Skip chrIdx
+            // Skip unit string
             do { fupd.get(ch); } while(ch!='\0');
-            fupd.seekg(4, std::ios::cur);
+            fupd.seekg(4, std::ios::cur); // Skip resolution
+            
+            // Update position
             std::streamoff pp = fupd.tellg();
             fupd.read(tmp8,8);
             int64_t oP = readInt64LE(tmp8);
             writeInt64LE(tmp8, oP + (int64_t)delta);
             fupd.seekp(pp, std::ios::beg);
             fupd.write(tmp8,8);
-            fupd.seekg(8, std::ios::cur);
+            fupd.seekg(8, std::ios::cur); // Skip sizeInBytes
         }
     }
 
     fupd.close();
-    std::cout << "Wrote " << outPath
+    std::cout << "Successfully wrote " << outPath
               << " with statistics/graphs inserted after software, pointers bumped by "
               << delta << " bytes.\n";
     return 0;
-}
+} 
